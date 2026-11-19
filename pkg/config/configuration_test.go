@@ -1,0 +1,1261 @@
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package config
+
+import (
+	"encoding/json"
+	"io"
+	"maps"
+	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opencensus.io/stats/view"
+	"gopkg.in/yaml.v3"
+
+	"github.com/dapr/dapr/pkg/buildinfo"
+	env "github.com/dapr/dapr/pkg/config/env"
+	"github.com/dapr/kit/logger"
+)
+
+func TestLoadStandaloneConfiguration(t *testing.T) {
+	testCases := []struct {
+		name          string
+		path          string
+		errorExpected bool
+	}{
+		{
+			name:          "Valid config file",
+			path:          "./testdata/config.yaml",
+			errorExpected: false,
+		},
+		{
+			name:          "Invalid file path",
+			path:          "invalid_file.yaml",
+			errorExpected: true,
+		},
+		{
+			name:          "Invalid config file",
+			path:          "./testdata/invalid_secrets_config.yaml",
+			errorExpected: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			config, err := LoadStandaloneConfiguration(tc.path)
+			if tc.errorExpected {
+				require.Error(t, err, "Expected an error")
+				assert.Nil(t, config, "Config should not be loaded")
+			} else {
+				require.NoError(t, err, "Unexpected error")
+				assert.NotNil(t, config, "Config not loaded as expected")
+			}
+		})
+	}
+
+	t.Run("parse environment variables", func(t *testing.T) {
+		t.Setenv("DAPR_SECRET", "keepitsecret")
+		config, err := LoadStandaloneConfiguration("./testdata/env_variables_config.yaml")
+		require.NoError(t, err, "Unexpected error")
+		assert.NotNil(t, config, "Config not loaded as expected")
+		assert.Equal(t, "keepitsecret", config.Spec.Secrets.Scopes[0].AllowedSecrets[0])
+	})
+
+	t.Run("check Kind and Name", func(t *testing.T) {
+		config, err := LoadStandaloneConfiguration("./testdata/config.yaml")
+		require.NoError(t, err, "Unexpected error")
+		assert.NotNil(t, config, "Config not loaded as expected")
+		assert.Equal(t, "secretappconfig", config.Name)
+		assert.Equal(t, "Configuration", config.Kind)
+	})
+
+	t.Run("metrics spec", func(t *testing.T) {
+		testCases := []struct {
+			name                    string
+			confFile                string
+			metricEnabled           bool
+			recordErrorCodesEnabled bool
+		}{
+			{
+				name:          "metric is enabled by default",
+				confFile:      "./testdata/config.yaml",
+				metricEnabled: true,
+			},
+			{
+				name:                    "recordErrorCodes is enabled by config",
+				confFile:                "./testdata/metric_rec.yaml",
+				metricEnabled:           true,
+				recordErrorCodesEnabled: true,
+			},
+			{
+				name:          "metric is disabled by config",
+				confFile:      "./testdata/metric_disabled.yaml",
+				metricEnabled: false,
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				config, err := LoadStandaloneConfiguration(tc.confFile)
+				require.NoError(t, err)
+				assert.Equal(t, tc.metricEnabled, config.Spec.MetricSpec.GetEnabled())
+				assert.Equal(t, tc.recordErrorCodesEnabled, config.Spec.MetricSpec.GetRecordErrorCodes())
+			})
+		}
+	})
+
+	t.Run("components spec", func(t *testing.T) {
+		testCases := []struct {
+			name           string
+			confFile       string
+			componentsDeny []string
+		}{
+			{
+				name:           "component deny list",
+				confFile:       "./testdata/components_config.yaml",
+				componentsDeny: []string{"foo.bar", "hello.world/v1"},
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				config, err := LoadStandaloneConfiguration(tc.confFile)
+				require.NoError(t, err)
+				assert.True(t, reflect.DeepEqual(tc.componentsDeny, config.Spec.ComponentsSpec.Deny))
+			})
+		}
+	})
+
+	t.Run("features spec", func(t *testing.T) {
+		testCases := []struct {
+			name           string
+			confFile       string
+			featureName    Feature
+			featureEnabled bool
+		}{
+			{
+				name:           "feature is enabled",
+				confFile:       "./testdata/feature_config.yaml",
+				featureName:    Feature("Actor.Reentrancy"),
+				featureEnabled: true,
+			},
+			{
+				name:           "feature is disabled",
+				confFile:       "./testdata/feature_config.yaml",
+				featureName:    Feature("Test.Feature"),
+				featureEnabled: false,
+			},
+			{
+				name:           "feature is disabled if missing",
+				confFile:       "./testdata/feature_config.yaml",
+				featureName:    Feature("Test.Missing"),
+				featureEnabled: false,
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				config, err := LoadStandaloneConfiguration(tc.confFile)
+				require.NoError(t, err)
+				config.LoadFeatures()
+				assert.Equal(t, tc.featureEnabled, config.IsFeatureEnabled(tc.featureName))
+			})
+		}
+	})
+
+	t.Run("mTLS spec", func(t *testing.T) {
+		config, err := LoadStandaloneConfiguration("./testdata/mtls_config.yaml")
+		require.NoError(t, err)
+		mtlsSpec := config.GetMTLSSpec()
+		assert.True(t, mtlsSpec.Enabled)
+		assert.Equal(t, "25s", mtlsSpec.WorkloadCertTTL)
+		assert.Equal(t, "1h", mtlsSpec.AllowedClockSkew)
+	})
+
+	t.Run("multiple configurations", func(t *testing.T) {
+		config, err := LoadStandaloneConfiguration("./testdata/feature_config.yaml", "./testdata/mtls_config.yaml")
+		require.NoError(t, err)
+
+		// From feature_config.yaml
+		config.LoadFeatures()
+		assert.True(t, config.IsFeatureEnabled("Actor.Reentrancy"))
+		assert.False(t, config.IsFeatureEnabled("Test.Feature"))
+
+		// From mtls_config.yaml
+		mtlsSpec := config.GetMTLSSpec()
+		assert.True(t, mtlsSpec.Enabled)
+		assert.Equal(t, "25s", mtlsSpec.WorkloadCertTTL)
+		assert.Equal(t, "1h", mtlsSpec.AllowedClockSkew)
+	})
+
+	t.Run("multiple configurations with overriding", func(t *testing.T) {
+		config, err := LoadStandaloneConfiguration("./testdata/feature_config.yaml", "./testdata/mtls_config.yaml", "./testdata/override.yaml")
+		require.NoError(t, err)
+
+		// From feature_config.yaml
+		// Should both be overridden
+		config.LoadFeatures()
+		assert.False(t, config.IsFeatureEnabled("Actor.Reentrancy"))
+		assert.True(t, config.IsFeatureEnabled("Test.Feature"))
+
+		// From mtls_config.yaml
+		mtlsSpec := config.GetMTLSSpec()
+		assert.False(t, mtlsSpec.Enabled) // Overridden
+		assert.Equal(t, "25s", mtlsSpec.WorkloadCertTTL)
+		assert.Equal(t, "1h", mtlsSpec.AllowedClockSkew)
+	})
+
+	t.Run("tracing spec headers and timeout", func(t *testing.T) {
+		config, err := LoadStandaloneConfiguration("./testdata/tracing_config.yaml")
+		require.NoError(t, err)
+		require.Len(t, config.Spec.TracingSpec.Otel.Headers, 2)
+		assert.Equal(t, "header1=value1", config.Spec.TracingSpec.Otel.Headers[0])
+		assert.Equal(t, "header2=value2", config.Spec.TracingSpec.Otel.Headers[1])
+		require.NotNil(t, config.Spec.TracingSpec.Otel.Timeout)
+		assert.Equal(t, 5*time.Second, *config.Spec.TracingSpec.Otel.Timeout)
+	})
+
+	t.Run("tracing invalid spec", func(t *testing.T) {
+		_, err := LoadStandaloneConfiguration("./testdata/tracing_invalid_config.yaml")
+		require.Error(t, err)
+	})
+}
+
+func TestSortAndValidateSecretsConfigration(t *testing.T) {
+	testCases := []struct {
+		name          string
+		config        Configuration
+		errorExpected bool
+	}{
+		{
+			name:          "empty configuration",
+			errorExpected: false,
+		},
+		{
+			name: "incorrect default access",
+			config: Configuration{
+				Spec: ConfigurationSpec{
+					Secrets: &SecretsSpec{
+						Scopes: []SecretsScope{
+							{
+								StoreName:     "testStore",
+								DefaultAccess: "incorrect",
+							},
+						},
+					},
+				},
+			},
+			errorExpected: true,
+		},
+		{
+			name: "empty default access",
+			config: Configuration{
+				Spec: ConfigurationSpec{
+					Secrets: &SecretsSpec{
+						Scopes: []SecretsScope{
+							{
+								StoreName: "testStore",
+							},
+						},
+					},
+				},
+			},
+			errorExpected: false,
+		},
+		{
+			name: "repeated store Name",
+			config: Configuration{
+				Spec: ConfigurationSpec{
+					Secrets: &SecretsSpec{
+						Scopes: []SecretsScope{
+							{
+								StoreName:     "testStore",
+								DefaultAccess: AllowAccess,
+							},
+							{
+								StoreName:     "testStore",
+								DefaultAccess: DenyAccess,
+							},
+						},
+					},
+				},
+			},
+			errorExpected: true,
+		},
+		{
+			name: "simple secrets config",
+			config: Configuration{
+				Spec: ConfigurationSpec{
+					Secrets: &SecretsSpec{
+						Scopes: []SecretsScope{
+							{
+								StoreName:      "testStore",
+								DefaultAccess:  DenyAccess,
+								AllowedSecrets: []string{"Z", "b", "a", "c"},
+							},
+						},
+					},
+				},
+			},
+			errorExpected: false,
+		},
+		{
+			name: "case-insensitive default access",
+			config: Configuration{
+				Spec: ConfigurationSpec{
+					Secrets: &SecretsSpec{
+						Scopes: []SecretsScope{
+							{
+								StoreName:      "testStore",
+								DefaultAccess:  "DeNY",
+								AllowedSecrets: []string{"Z", "b", "a", "c"},
+							},
+						},
+					},
+				},
+			},
+			errorExpected: false,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.config.sortAndValidateSecretsConfiguration()
+			if tc.errorExpected {
+				require.Error(t, err, "expected validation to fail")
+			} else if tc.config.Spec.Secrets != nil {
+				for _, scope := range tc.config.Spec.Secrets.Scopes {
+					assert.True(t, slices.IsSorted(scope.AllowedSecrets), "expected sorted slice")
+					assert.True(t, slices.IsSorted(scope.DeniedSecrets), "expected sorted slice")
+				}
+			}
+		})
+	}
+}
+
+func TestIsSecretAllowed(t *testing.T) {
+	testCases := []struct {
+		name           string
+		scope          SecretsScope
+		secretKey      string
+		expectedResult bool
+	}{
+		{
+			name:           "Empty scope default allow all",
+			secretKey:      "random",
+			expectedResult: true,
+		},
+		{
+			name:           "Empty scope default allow all empty key",
+			expectedResult: true,
+		},
+		{
+			name: "default deny all secrets empty key",
+			scope: SecretsScope{
+				StoreName:     "testName",
+				DefaultAccess: "DeNy", // check case-insensitivity
+			},
+			secretKey:      "",
+			expectedResult: false,
+		},
+		{
+			name: "default allow all secrets empty key",
+			scope: SecretsScope{
+				StoreName:     "testName",
+				DefaultAccess: "AllOw", // check case-insensitivity
+			},
+			secretKey:      "",
+			expectedResult: true,
+		},
+		{
+			name: "default deny all secrets",
+			scope: SecretsScope{
+				StoreName:     "testName",
+				DefaultAccess: DenyAccess,
+			},
+			secretKey:      "random",
+			expectedResult: false,
+		},
+		{
+			name: "default deny with specific allow secrets",
+			scope: SecretsScope{
+				StoreName:      "testName",
+				DefaultAccess:  DenyAccess,
+				AllowedSecrets: []string{"key1"},
+			},
+			secretKey:      "key1",
+			expectedResult: true,
+		},
+		{
+			name: "default allow with specific allow secrets",
+			scope: SecretsScope{
+				StoreName:      "testName",
+				DefaultAccess:  AllowAccess,
+				AllowedSecrets: []string{"key1"},
+			},
+			secretKey:      "key2",
+			expectedResult: false,
+		},
+		{
+			name: "default allow with specific deny secrets",
+			scope: SecretsScope{
+				StoreName:     "testName",
+				DefaultAccess: AllowAccess,
+				DeniedSecrets: []string{"key1"},
+			},
+			secretKey:      "key1",
+			expectedResult: false,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expectedResult, tc.scope.IsSecretAllowed(tc.secretKey), "incorrect access")
+		})
+	}
+}
+
+func TestContainsKey(t *testing.T) {
+	s := []string{"a", "b", "c", "z"}
+	assert.False(t, containsKey(s, "h"), "unexpected result")
+	assert.True(t, containsKey(s, "b"), "unexpected result")
+}
+
+func TestFeatureEnabled(t *testing.T) {
+	config := Configuration{
+		Spec: ConfigurationSpec{
+			Features: []FeatureSpec{
+				{
+					Name:    "testEnabled",
+					Enabled: true,
+				},
+				{
+					Name:    "testDisabled",
+					Enabled: false,
+				},
+			},
+		},
+	}
+	config.LoadFeatures()
+
+	assert.True(t, config.IsFeatureEnabled("testEnabled"))
+	assert.False(t, config.IsFeatureEnabled("testDisabled"))
+	assert.False(t, config.IsFeatureEnabled("testMissing"))
+
+	// Test config.EnabledFeatures
+	// We sort the values before comparing because order isn't guaranteed (and doesn't matter)
+	actual := config.EnabledFeatures()
+	expect := append([]string{"testEnabled"}, buildinfo.Features()...)
+	slices.Sort(actual)
+	slices.Sort(expect)
+	assert.Equal(t, actual, expect)
+}
+
+func TestSetTracingSpecFromEnv(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otlpendpoint:1234")
+	t.Setenv("OTEL_EXPORTER_OTLP_INSECURE", "true")
+	t.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "api-key1=value1,api-key2=value2")
+
+	// get default configuration
+	conf := LoadDefaultConfiguration()
+
+	// set tracing spec from env
+	err := SetTracingSpecFromEnv(conf)
+	require.NoError(t, err)
+
+	assert.Equal(t, "otlpendpoint:1234", conf.Spec.TracingSpec.Otel.EndpointAddress)
+	assert.Equal(t, "http", conf.Spec.TracingSpec.Otel.Protocol)
+	require.False(t, conf.Spec.TracingSpec.Otel.GetIsSecure())
+	require.Len(t, conf.Spec.TracingSpec.Otel.Headers, 2)
+	assert.Contains(t, conf.Spec.TracingSpec.Otel.Headers, "api-key1=value1")
+	assert.Contains(t, conf.Spec.TracingSpec.Otel.Headers, "api-key2=value2")
+
+	// Spec from config file should not be overridden
+	conf = LoadDefaultConfiguration()
+	conf.Spec.TracingSpec.Otel.EndpointAddress = "configfileendpoint:4321"
+	conf.Spec.TracingSpec.Otel.Protocol = "grpc"
+	conf.Spec.TracingSpec.Otel.IsSecure = new(true)
+	conf.Spec.TracingSpec.Otel.Headers = []string{"another-key1=value1"}
+
+	// set tracing spec from env
+	err = SetTracingSpecFromEnv(conf)
+	require.NoError(t, err)
+
+	assert.Equal(t, "configfileendpoint:4321", conf.Spec.TracingSpec.Otel.EndpointAddress)
+	assert.Equal(t, "grpc", conf.Spec.TracingSpec.Otel.Protocol)
+	require.True(t, conf.Spec.TracingSpec.Otel.GetIsSecure())
+	require.Len(t, conf.Spec.TracingSpec.Otel.Headers, 1)
+	assert.Equal(t, "another-key1=value1", conf.Spec.TracingSpec.Otel.Headers[0])
+}
+
+func TestTracingPrecedenceFromEnv(t *testing.T) {
+	t.Setenv(env.OtlpExporterTracesEndpoint, "tracesendpoint:4321")
+	t.Setenv(env.OtlpExporterEndpoint, "configfileendpoint:4321")
+	t.Setenv(env.OtlpExporterTracesProtocol, "grpc")
+	t.Setenv(env.OtlpExporterProtocol, "http")
+	t.Setenv(env.OtlpExporterTracesHeaders, "traces-key1=value1,traces-key2=value2")
+	t.Setenv(env.OtlpExporterHeaders, "key1=value1,key2=value2")
+	t.Setenv(env.OtlpExporterTracesTimeout, "2000")
+	t.Setenv(env.OtlpExporterTimeout, "1000")
+
+	conf := LoadDefaultConfiguration()
+	err := SetTracingSpecFromEnv(conf)
+	require.NoError(t, err)
+
+	assert.Equal(t, "tracesendpoint:4321", conf.Spec.TracingSpec.Otel.EndpointAddress)
+	assert.Equal(t, "grpc", conf.Spec.TracingSpec.Otel.Protocol)
+	require.Len(t, conf.Spec.TracingSpec.Otel.Headers, 2)
+	assert.Contains(t, conf.Spec.TracingSpec.Otel.Headers, "traces-key1=value1")
+	assert.Contains(t, conf.Spec.TracingSpec.Otel.Headers, "traces-key2=value2")
+	require.NotNil(t, conf.Spec.TracingSpec.Otel.Timeout)
+	assert.Equal(t, 2*time.Second, *conf.Spec.TracingSpec.Otel.Timeout)
+}
+
+func TestTracingConfigHeadersPrecedenceOverEnv(t *testing.T) {
+	// When endpointAddress is already set in config, SetTracingSpecFromEnv
+	// returns early and env var headers/timeout are not applied
+	t.Setenv(env.OtlpExporterTracesHeaders, "env-key=env-value")
+	t.Setenv(env.OtlpExporterTracesTimeout, "5000")
+
+	conf := &Configuration{
+		Spec: ConfigurationSpec{
+			TracingSpec: &TracingSpec{
+				Otel: &OtelSpec{
+					EndpointAddress: "already-set:4317",
+					Protocol:        "grpc",
+					Headers:         []string{"config-key=config-value"},
+				},
+			},
+		},
+	}
+
+	err := SetTracingSpecFromEnv(conf)
+	require.NoError(t, err)
+
+	// Config headers should be unchanged; env var headers should NOT be appended
+	require.Len(t, conf.Spec.TracingSpec.Otel.Headers, 1)
+	assert.Equal(t, "config-key=config-value", conf.Spec.TracingSpec.Otel.Headers[0])
+
+	// Timeout should remain nil since env vars were not applied
+	assert.Nil(t, conf.Spec.TracingSpec.Otel.Timeout)
+}
+
+func TestTracingTimeoutFromEnv(t *testing.T) {
+	t.Setenv(env.OtlpExporterTracesTimeout, "invalid")
+	conf := LoadDefaultConfiguration()
+	err := SetTracingSpecFromEnv(conf)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "invalid syntax")
+	assert.Nil(t, conf.Spec.TracingSpec.Otel.Timeout)
+
+	t.Setenv(env.OtlpExporterTracesTimeout, "-1")
+	conf = LoadDefaultConfiguration()
+	err = SetTracingSpecFromEnv(conf)
+	require.NoError(t, err)
+	assert.Nil(t, conf.Spec.TracingSpec.Otel.Timeout)
+}
+
+func TestAPIAccessRules(t *testing.T) {
+	config := &Configuration{
+		Spec: ConfigurationSpec{
+			APISpec: &APISpec{
+				Allowed: APIAccessRules{
+					APIAccessRule{Name: "foo", Version: "v1", Protocol: "http"},
+					APIAccessRule{Name: "MyMethod", Version: "v1alpha1", Protocol: "grpc"},
+				},
+				Denied: APIAccessRules{
+					APIAccessRule{Name: "bar", Version: "v1", Protocol: "http"},
+				},
+			},
+		},
+	}
+
+	apiSpec := config.Spec.APISpec
+
+	assert.Equal(t, []string{"v1/foo"}, slices.Collect(maps.Keys(apiSpec.Allowed.GetRulesByProtocol(APIAccessRuleProtocolHTTP))))
+	assert.Equal(t, []string{"v1alpha1/MyMethod"}, slices.Collect(maps.Keys(apiSpec.Allowed.GetRulesByProtocol(APIAccessRuleProtocolGRPC))))
+	assert.Equal(t, []string{"v1/bar"}, slices.Collect(maps.Keys(apiSpec.Denied.GetRulesByProtocol(APIAccessRuleProtocolHTTP))))
+	assert.Empty(t, slices.Collect(maps.Keys(apiSpec.Denied.GetRulesByProtocol(APIAccessRuleProtocolGRPC))))
+}
+
+func TestSortMetrics(t *testing.T) {
+	t.Run("metrics overrides metric - enabled false", func(t *testing.T) {
+		config := &Configuration{
+			Spec: ConfigurationSpec{
+				MetricSpec: &MetricSpec{
+					Enabled: new(true),
+					Rules: []MetricsRule{
+						{
+							Name: "rule",
+						},
+					},
+				},
+				MetricsSpec: &MetricSpec{
+					Enabled: new(false),
+				},
+			},
+		}
+
+		config.sortMetricsSpec()
+		assert.False(t, config.Spec.MetricSpec.GetEnabled())
+		assert.Equal(t, "rule", config.Spec.MetricSpec.Rules[0].Name)
+	})
+
+	t.Run("metrics overrides metric - enabled true", func(t *testing.T) {
+		config := &Configuration{
+			Spec: ConfigurationSpec{
+				MetricSpec: &MetricSpec{
+					Enabled: new(false),
+					Rules: []MetricsRule{
+						{
+							Name: "rule",
+						},
+					},
+				},
+				MetricsSpec: &MetricSpec{
+					Enabled: new(true),
+				},
+			},
+		}
+
+		config.sortMetricsSpec()
+		assert.True(t, config.Spec.MetricSpec.GetEnabled())
+		assert.Equal(t, "rule", config.Spec.MetricSpec.Rules[0].Name)
+	})
+
+	t.Run("nil metrics enabled doesn't overrides", func(t *testing.T) {
+		config := &Configuration{
+			Spec: ConfigurationSpec{
+				MetricSpec: &MetricSpec{
+					Enabled: new(true),
+					Rules: []MetricsRule{
+						{
+							Name: "rule",
+						},
+					},
+				},
+				MetricsSpec: &MetricSpec{},
+			},
+		}
+
+		config.sortMetricsSpec()
+		assert.True(t, config.Spec.MetricSpec.GetEnabled())
+		assert.Equal(t, "rule", config.Spec.MetricSpec.Rules[0].Name)
+	})
+
+	t.Run("metrics overrides metric - workflow", func(t *testing.T) {
+		config := &Configuration{
+			Spec: ConfigurationSpec{
+				MetricSpec: &MetricSpec{},
+				MetricsSpec: &MetricSpec{
+					Workflow: &WorkflowMetrics{
+						LatencyDistributionBuckets: new([]int{10, 20, 30}),
+					},
+				},
+			},
+		}
+
+		config.sortMetricsSpec()
+		require.NotNil(t, config.Spec.MetricSpec.Workflow)
+		require.NotNil(t, config.Spec.MetricSpec.Workflow.LatencyDistributionBuckets)
+		assert.Equal(t, []int{10, 20, 30}, *config.Spec.MetricSpec.Workflow.LatencyDistributionBuckets)
+	})
+}
+
+func TestMetricsGetHTTPIncreasedCardinality(t *testing.T) {
+	log := logger.NewLogger("test")
+	log.SetOutput(io.Discard)
+
+	t.Run("no http configuration, returns true", func(t *testing.T) {
+		m := MetricSpec{
+			HTTP: nil,
+		}
+		assert.True(t, m.GetHTTPIncreasedCardinality(log))
+	})
+
+	t.Run("nil value, returns true", func(t *testing.T) {
+		m := MetricSpec{
+			HTTP: &MetricHTTP{
+				IncreasedCardinality: nil,
+			},
+		}
+		assert.True(t, m.GetHTTPIncreasedCardinality(log))
+	})
+
+	t.Run("value is set to true", func(t *testing.T) {
+		m := MetricSpec{
+			HTTP: &MetricHTTP{
+				IncreasedCardinality: new(true),
+			},
+		}
+		assert.True(t, m.GetHTTPIncreasedCardinality(log))
+	})
+
+	t.Run("value is set to false", func(t *testing.T) {
+		m := MetricSpec{
+			HTTP: &MetricHTTP{
+				IncreasedCardinality: new(false),
+			},
+		}
+		assert.False(t, m.GetHTTPIncreasedCardinality(log))
+	})
+}
+
+func TestMetricsGetHTTPLatencyDistributionBuckets(t *testing.T) {
+	log := logger.NewLogger("test")
+	log.SetOutput(io.Discard)
+
+	defaultLatencyDistribution := []float64{1, 2, 3, 4, 5, 6, 8, 10, 13, 16, 20, 25, 30, 40, 50, 65, 80, 100, 130, 160, 200, 250, 300, 400, 500, 650, 800, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000}
+	latencyDistribution := view.Distribution(defaultLatencyDistribution...)
+	t.Run("no http configuration, returns default latency distribution buckets", func(t *testing.T) {
+		m := MetricSpec{
+			HTTP: nil,
+		}
+		assert.Equal(t, latencyDistribution.Buckets, m.GetLatencyDistribution(log).Buckets)
+	})
+
+	t.Run("nil value, returns latency distribution buckets", func(t *testing.T) {
+		m := MetricSpec{
+			LatencyDistributionBuckets: nil,
+		}
+		assert.Equal(t, latencyDistribution.Buckets, m.GetLatencyDistribution(log).Buckets)
+	})
+
+	customLatencyDistribution := []float64{1, 2, 3}
+	latencyDistribution = view.Distribution(customLatencyDistribution...)
+	t.Run("value is set to list of integers", func(t *testing.T) {
+		m := MetricSpec{
+			LatencyDistributionBuckets: new([]int{1, 2, 3}),
+		}
+		assert.Equal(t, latencyDistribution.Buckets, m.GetLatencyDistribution(log).Buckets)
+	})
+}
+
+func TestMetricsGetWorkflowLatencyDistribution(t *testing.T) {
+	log := logger.NewLogger("test")
+	log.SetOutput(io.Discard)
+
+	sharedDistribution := view.Distribution([]float64{1, 2, 3, 4, 5}...)
+
+	t.Run("nil workflow spec falls back to the shared distribution", func(t *testing.T) {
+		m := MetricSpec{
+			Workflow: nil,
+		}
+		assert.Same(t, sharedDistribution, m.GetWorkflowLatencyDistribution(log, sharedDistribution))
+	})
+
+	t.Run("nil buckets fall back to the shared distribution", func(t *testing.T) {
+		m := MetricSpec{
+			Workflow: &WorkflowMetrics{LatencyDistributionBuckets: nil},
+		}
+		assert.Same(t, sharedDistribution, m.GetWorkflowLatencyDistribution(log, sharedDistribution))
+	})
+
+	t.Run("empty buckets fall back to the shared distribution", func(t *testing.T) {
+		m := MetricSpec{
+			Workflow: &WorkflowMetrics{LatencyDistributionBuckets: new([]int{})},
+		}
+		assert.Same(t, sharedDistribution, m.GetWorkflowLatencyDistribution(log, sharedDistribution))
+	})
+
+	t.Run("set buckets override the shared distribution", func(t *testing.T) {
+		m := MetricSpec{
+			Workflow: &WorkflowMetrics{LatencyDistributionBuckets: new([]int{10, 20, 30})},
+		}
+		got := m.GetWorkflowLatencyDistribution(log, sharedDistribution)
+		assert.Equal(t, view.Distribution([]float64{10, 20, 30}...).Buckets, got.Buckets)
+		assert.NotSame(t, sharedDistribution, got)
+	})
+
+	t.Run("nil unit defaults to milliseconds (no scaling)", func(t *testing.T) {
+		m := MetricSpec{
+			Workflow: &WorkflowMetrics{
+				LatencyDistributionBuckets: new([]int{1, 2, 3}),
+				LatencyDistributionUnits:   nil,
+			},
+		}
+		got := m.GetWorkflowLatencyDistribution(log, sharedDistribution)
+		assert.Equal(t, view.Distribution([]float64{1, 2, 3}...).Buckets, got.Buckets)
+	})
+
+	t.Run("second unit scales buckets into milliseconds", func(t *testing.T) {
+		unit := time.Second
+		m := MetricSpec{
+			Workflow: &WorkflowMetrics{
+				LatencyDistributionBuckets: new([]int{1, 2, 5}),
+				LatencyDistributionUnits:   &unit,
+			},
+		}
+		got := m.GetWorkflowLatencyDistribution(log, sharedDistribution)
+		assert.Equal(t, view.Distribution([]float64{1000, 2000, 5000}...).Buckets, got.Buckets)
+	})
+
+	t.Run("unit is ignored when no buckets are set", func(t *testing.T) {
+		unit := time.Second
+		m := MetricSpec{
+			Workflow: &WorkflowMetrics{LatencyDistributionUnits: &unit},
+		}
+		assert.Same(t, sharedDistribution, m.GetWorkflowLatencyDistribution(log, sharedDistribution))
+	})
+}
+
+func TestWorkflowMetricsUnmarshalLatencyDistributionUnits(t *testing.T) {
+	t.Run("operator JSON encodes the unit as a metav1.Duration string", func(t *testing.T) {
+		var m MetricSpec
+		err := json.Unmarshal([]byte(`{"workflow":{"latencyDistributionBuckets":[1,2,3],"latencyDistributionUnits":"1s"}}`), &m)
+		require.NoError(t, err)
+		require.NotNil(t, m.Workflow)
+		require.NotNil(t, m.Workflow.LatencyDistributionUnits)
+		assert.Equal(t, time.Second, *m.Workflow.LatencyDistributionUnits)
+		require.NotNil(t, m.Workflow.LatencyDistributionBuckets)
+		assert.Equal(t, []int{1, 2, 3}, *m.Workflow.LatencyDistributionBuckets)
+	})
+
+	t.Run("standalone YAML decodes Go duration strings natively", func(t *testing.T) {
+		var m MetricSpec
+		err := yaml.Unmarshal([]byte("workflow:\n  latencyDistributionBuckets: [1, 2, 3]\n  latencyDistributionUnits: 1s\n"), &m)
+		require.NoError(t, err)
+		require.NotNil(t, m.Workflow)
+		require.NotNil(t, m.Workflow.LatencyDistributionUnits)
+		assert.Equal(t, time.Second, *m.Workflow.LatencyDistributionUnits)
+	})
+}
+
+func TestMetricsGetHTTPPathMatching(t *testing.T) {
+	t.Run("no http configuration, returns nil", func(t *testing.T) {
+		m := MetricSpec{
+			HTTP: nil,
+		}
+		assert.Nil(t, m.GetHTTPPathMatching())
+	})
+
+	t.Run("nil value, returns nil", func(t *testing.T) {
+		m := MetricSpec{
+			HTTP: &MetricHTTP{
+				PathMatching: nil,
+			},
+		}
+		assert.Nil(t, m.GetHTTPPathMatching())
+	})
+
+	t.Run("config is enabled", func(t *testing.T) {
+		m := MetricSpec{
+			HTTP: &MetricHTTP{
+				PathMatching: []string{"/resource/1"},
+			},
+		}
+		config := m.GetHTTPPathMatching()
+		assert.Equal(t, []string{"/resource/1"}, config)
+	})
+}
+
+func TestMetricsGetHTTPExcludeVerbs(t *testing.T) {
+	t.Run("no configuration, returns false", func(t *testing.T) {
+		m := MetricSpec{
+			HTTP: nil,
+		}
+		assert.False(t, m.GetHTTPExcludeVerbs())
+	})
+
+	t.Run("nil value, returns false", func(t *testing.T) {
+		m := MetricSpec{
+			HTTP: &MetricHTTP{
+				ExcludeVerbs: nil,
+			},
+		}
+		assert.False(t, m.GetHTTPExcludeVerbs())
+	})
+
+	t.Run("config is enabled", func(t *testing.T) {
+		m := MetricSpec{
+			HTTP: &MetricHTTP{
+				ExcludeVerbs: new(true),
+			},
+		}
+		assert.True(t, m.GetHTTPExcludeVerbs())
+	})
+
+	t.Run("config is disabled", func(t *testing.T) {
+		m := MetricSpec{
+			HTTP: &MetricHTTP{
+				ExcludeVerbs: new(false),
+			},
+		}
+		assert.False(t, m.GetHTTPExcludeVerbs())
+	})
+}
+
+func TestWorkflowStateRetentionPolicyUnmarshalJSON(t *testing.T) {
+	t.Run("all fields with string durations", func(t *testing.T) {
+		data := `{"anyTerminal":"1s","completed":"2h","failed":"30m","terminated":"168h"}`
+		var p WorkflowStateRetentionPolicy
+		require.NoError(t, json.Unmarshal([]byte(data), &p))
+
+		require.NotNil(t, p.AnyTerminal)
+		assert.Equal(t, time.Second, *p.AnyTerminal)
+
+		require.NotNil(t, p.Completed)
+		assert.Equal(t, 2*time.Hour, *p.Completed)
+
+		require.NotNil(t, p.Failed)
+		assert.Equal(t, 30*time.Minute, *p.Failed)
+
+		require.NotNil(t, p.Terminated)
+		assert.Equal(t, 168*time.Hour, *p.Terminated)
+	})
+
+	t.Run("partial fields", func(t *testing.T) {
+		data := `{"anyTerminal":"5s"}`
+		var p WorkflowStateRetentionPolicy
+		require.NoError(t, json.Unmarshal([]byte(data), &p))
+
+		require.NotNil(t, p.AnyTerminal)
+		assert.Equal(t, 5*time.Second, *p.AnyTerminal)
+
+		assert.Nil(t, p.Completed)
+		assert.Nil(t, p.Failed)
+		assert.Nil(t, p.Terminated)
+	})
+
+	t.Run("empty object", func(t *testing.T) {
+		data := `{}`
+		var p WorkflowStateRetentionPolicy
+		require.NoError(t, json.Unmarshal([]byte(data), &p))
+
+		assert.Nil(t, p.AnyTerminal)
+		assert.Nil(t, p.Completed)
+		assert.Nil(t, p.Failed)
+		assert.Nil(t, p.Terminated)
+	})
+
+	t.Run("invalid duration string", func(t *testing.T) {
+		data := `{"anyTerminal":"notaduration"}`
+		var p WorkflowStateRetentionPolicy
+		assert.Error(t, json.Unmarshal([]byte(data), &p))
+	})
+}
+
+func TestHasSchedulerConcurrencyLimits(t *testing.T) {
+	i32 := func(v int32) *int32 { return &v }
+
+	var nilSpec *WorkflowSpec
+	require.False(t, nilSpec.HasSchedulerConcurrencyLimits())
+	require.False(t, (&WorkflowSpec{}).HasSchedulerConcurrencyLimits())
+	require.False(t, (&WorkflowSpec{
+		MaxConcurrentWorkflowInvocations: 5,
+		MaxConcurrentActivityInvocations: 5,
+	}).HasSchedulerConcurrencyLimits(), "per-host caps are worker-enforced and must not disable the fast path")
+	require.False(t, (&WorkflowSpec{
+		GlobalMaxConcurrentWorkflowInvocations: i32(0),
+	}).HasSchedulerConcurrencyLimits(), "a non-positive global cap means unset")
+
+	require.True(t, (&WorkflowSpec{GlobalMaxConcurrentWorkflowInvocations: i32(2)}).HasSchedulerConcurrencyLimits())
+	require.True(t, (&WorkflowSpec{GlobalMaxConcurrentActivityInvocations: i32(2)}).HasSchedulerConcurrencyLimits())
+	name := "wf"
+	require.True(t, (&WorkflowSpec{
+		WorkflowConcurrencyLimits: []NamedConcurrencyLimit{{Name: &name, MaxConcurrent: i32(1)}},
+	}).HasSchedulerConcurrencyLimits())
+	require.True(t, (&WorkflowSpec{
+		ActivityConcurrencyLimits: []ActivityConcurrencyLimit{{Name: &name, MaxConcurrent: i32(1)}},
+	}).HasSchedulerConcurrencyLimits())
+
+	// Entries the scheduler ignores must not disable the fast path.
+	require.False(t, (&WorkflowSpec{
+		WorkflowConcurrencyLimits: []NamedConcurrencyLimit{{MaxConcurrent: i32(1)}},
+	}).HasSchedulerConcurrencyLimits(), "nil name is not enforced")
+	require.False(t, (&WorkflowSpec{
+		WorkflowConcurrencyLimits: []NamedConcurrencyLimit{{Name: &name}},
+	}).HasSchedulerConcurrencyLimits(), "nil max is not enforced")
+	require.False(t, (&WorkflowSpec{
+		ActivityConcurrencyLimits: []ActivityConcurrencyLimit{{Name: &name, MaxConcurrent: i32(0)}},
+	}).HasSchedulerConcurrencyLimits(), "non-positive max is not enforced")
+	require.True(t, (&WorkflowSpec{
+		WorkflowConcurrencyLimits: []NamedConcurrencyLimit{{MaxConcurrent: i32(1)}, {Name: &name, MaxConcurrent: i32(1)}},
+	}).HasSchedulerConcurrencyLimits(), "one enforced entry among ignored ones counts")
+	require.False(t, (&WorkflowSpec{
+		ActivityConcurrencyLimits: []ActivityConcurrencyLimit{{Name: &name, DispatchMode: new(ActivityDispatchModePull)}},
+	}).HasSchedulerConcurrencyLimits(), "a dispatch-only entry is not a scheduler-enforced limit")
+}
+
+func TestActivityDispatchPull(t *testing.T) {
+	email := "SendEmail"
+	transcode := "Transcode"
+
+	var nilSpec *WorkflowSpec
+	require.False(t, nilSpec.ActivityDispatchPull(email))
+	require.False(t, nilSpec.HasPullActivityDispatch())
+	require.False(t, (&WorkflowSpec{}).ActivityDispatchPull(email))
+	require.False(t, (&WorkflowSpec{}).HasPullActivityDispatch())
+
+	appPull := &WorkflowSpec{ActivityDispatchMode: new(ActivityDispatchModePull)}
+	require.True(t, appPull.ActivityDispatchPull(email))
+	require.True(t, appPull.HasPullActivityDispatch())
+
+	appPullOptOut := &WorkflowSpec{
+		ActivityDispatchMode:      new(ActivityDispatchModePull),
+		ActivityConcurrencyLimits: []ActivityConcurrencyLimit{{Name: &email, DispatchMode: new(ActivityDispatchModeHashed)}},
+	}
+	require.False(t, appPullOptOut.ActivityDispatchPull(email), "per-name hashed overrides app-wide pull")
+	require.True(t, appPullOptOut.ActivityDispatchPull(transcode))
+	require.True(t, appPullOptOut.HasPullActivityDispatch())
+
+	perName := &WorkflowSpec{
+		ActivityConcurrencyLimits: []ActivityConcurrencyLimit{
+			{Name: &email, MaxConcurrent: new(int32(5))},
+			{Name: &transcode, DispatchMode: new(ActivityDispatchModePull)},
+		},
+	}
+	require.False(t, perName.ActivityDispatchPull(email), "an entry without dispatchMode inherits the app default")
+	require.True(t, perName.ActivityDispatchPull(transcode))
+	require.False(t, perName.ActivityDispatchPull("other"))
+	require.True(t, perName.HasPullActivityDispatch())
+}
+
+func TestValidateWorkflowSpec(t *testing.T) {
+	name := "SendEmail"
+	conf := func(w *WorkflowSpec) *Configuration {
+		c := LoadDefaultConfiguration()
+		c.Spec.WorkflowSpec = w
+		return c
+	}
+
+	require.NoError(t, conf(nil).validateWorkflowSpec())
+	require.NoError(t, conf(&WorkflowSpec{}).validateWorkflowSpec())
+	require.NoError(t, conf(&WorkflowSpec{ActivityDispatchMode: new(ActivityDispatchModeHashed)}).validateWorkflowSpec())
+	require.NoError(t, conf(&WorkflowSpec{
+		MaxConcurrentActivityInvocations: 2,
+		ActivityDispatchMode:             new(ActivityDispatchModePull),
+	}).validateWorkflowSpec())
+	require.NoError(t, conf(&WorkflowSpec{
+		MaxConcurrentActivityInvocations: 1,
+		ActivityConcurrencyLimits:        []ActivityConcurrencyLimit{{Name: &name, DispatchMode: new(ActivityDispatchModePull)}},
+	}).validateWorkflowSpec())
+
+	err := conf(&WorkflowSpec{ActivityDispatchMode: new("random")}).validateWorkflowSpec()
+	require.ErrorContains(t, err, `invalid workflow activityDispatchMode "random"`)
+
+	err = conf(&WorkflowSpec{
+		MaxConcurrentActivityInvocations: 1,
+		ActivityConcurrencyLimits:        []ActivityConcurrencyLimit{{Name: &name, DispatchMode: new("push")}},
+	}).validateWorkflowSpec()
+	require.ErrorContains(t, err, `invalid dispatchMode "push"`)
+
+	require.NoError(t, conf(&WorkflowSpec{
+		ActivityConcurrencyLimits: []ActivityConcurrencyLimit{{Name: &name}, {Name: &name}},
+	}).validateWorkflowSpec(), "duplicate limits without a dispatchMode load as before")
+
+	for _, limits := range [][]ActivityConcurrencyLimit{
+		{{Name: &name, DispatchMode: new(ActivityDispatchModePull)}, {Name: &name}},
+		{{Name: &name}, {Name: &name, DispatchMode: new(ActivityDispatchModeHashed)}},
+	} {
+		err = conf(&WorkflowSpec{
+			MaxConcurrentActivityInvocations: 1,
+			ActivityConcurrencyLimits:        limits,
+		}).validateWorkflowSpec()
+		require.ErrorContains(t, err, `duplicate activity name "SendEmail" with a dispatchMode`)
+	}
+
+	err = conf(&WorkflowSpec{
+		MaxConcurrentActivityInvocations: 1,
+		ActivityConcurrencyLimits:        []ActivityConcurrencyLimit{{DispatchMode: new(ActivityDispatchModePull)}},
+	}).validateWorkflowSpec()
+	require.ErrorContains(t, err, `dispatchMode "pull" in workflow activityConcurrencyLimits requires a name`)
+	require.False(t, (&WorkflowSpec{
+		ActivityConcurrencyLimits: []ActivityConcurrencyLimit{{DispatchMode: new(ActivityDispatchModePull)}},
+	}).HasPullActivityDispatch(), "a nameless entry can never match an activity")
+
+	err = conf(&WorkflowSpec{ActivityDispatchMode: new(ActivityDispatchModePull)}).validateWorkflowSpec()
+	require.ErrorContains(t, err, "requires maxConcurrentActivityInvocations")
+
+	err = conf(&WorkflowSpec{
+		ActivityConcurrencyLimits: []ActivityConcurrencyLimit{{Name: &name, DispatchMode: new(ActivityDispatchModePull)}},
+	}).validateWorkflowSpec()
+	require.ErrorContains(t, err, "requires maxConcurrentActivityInvocations")
+
+	err = conf(&WorkflowSpec{
+		MaxConcurrentActivityInvocations: 0,
+		ActivityDispatchMode:             new(ActivityDispatchModePull),
+	}).validateWorkflowSpec()
+	require.ErrorContains(t, err, "requires maxConcurrentActivityInvocations", "zero means unset")
+}
+
+func TestLoadStandaloneConfigurationRejectsPullWithoutSlots(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`apiVersion: dapr.io/v1alpha1
+kind: Configuration
+metadata:
+  name: pull
+spec:
+  workflow:
+    activityDispatchMode: pull
+`), 0o600))
+	_, err := LoadStandaloneConfiguration(path)
+	require.ErrorContains(t, err, "requires maxConcurrentActivityInvocations")
+
+	require.NoError(t, os.WriteFile(path, []byte(`apiVersion: dapr.io/v1alpha1
+kind: Configuration
+metadata:
+  name: pull
+spec:
+  workflow:
+    maxConcurrentActivityInvocations: 3
+    activityDispatchMode: pull
+    activityConcurrencyLimits:
+      - name: SendEmail
+        maxConcurrent: 5
+        dispatchMode: hashed
+`), 0o600))
+	c, err := LoadStandaloneConfiguration(path)
+	require.NoError(t, err)
+	require.True(t, c.Spec.WorkflowSpec.ActivityDispatchPull("Transcode"))
+	require.False(t, c.Spec.WorkflowSpec.ActivityDispatchPull("SendEmail"))
+	require.Equal(t, int32(5), *c.Spec.WorkflowSpec.ActivityConcurrencyLimits[0].MaxConcurrent)
+}
+
+func TestActivityPriority(t *testing.T) {
+	var nilSpec *WorkflowSpec
+	level, weight := nilSpec.ActivityPriority("wf", "act")
+	require.Empty(t, level)
+	require.Zero(t, weight)
+	level, weight = (&WorkflowSpec{}).ActivityPriority("wf", "act")
+	require.Empty(t, level)
+	require.Zero(t, weight)
+
+	spec := &WorkflowSpec{Priority: &WorkflowPriority{
+		Default: &PriorityValues{PriorityLevel: new(PriorityLevelHigh), FairnessWeight: new(uint32(2))},
+		Workflows: []NamedPriorityValues{
+			{Name: new("critical-wf"), PriorityLevel: new(PriorityLevelCritical)},
+			{Name: new("heavy-wf"), FairnessWeight: new(uint32(7))},
+		},
+		Activities: []NamedPriorityValues{
+			{Name: new("weighted"), FairnessWeight: new(uint32(3))},
+			{Name: new("background"), PriorityLevel: new(PriorityLevelBackground), FairnessWeight: new(uint32(5))},
+		},
+	}}
+
+	check := func(workflow, activity, wantLevel string, wantWeight uint32, msg string) {
+		t.Helper()
+		level, weight := spec.ActivityPriority(workflow, activity)
+		require.Equal(t, wantLevel, level, msg)
+		require.Equal(t, wantWeight, weight, msg)
+	}
+	check("other-wf", "other", PriorityLevelHigh, 2, "nothing of its own: the default")
+	check("critical-wf", "other", PriorityLevelCritical, 2, "level from the calling workflow, weight from the default")
+	check("critical-wf", "weighted", PriorityLevelCritical, 3, "own weight, level from the calling workflow")
+	check("heavy-wf", "weighted", PriorityLevelHigh, 3, "own weight beats the workflow's weight")
+	check("heavy-wf", "other", PriorityLevelHigh, 7, "weight from the calling workflow")
+	check("critical-wf", "background", PriorityLevelBackground, 5, "own values beat the workflow's")
+}
+
+func TestValidateWorkflowPriority(t *testing.T) {
+	conf := func(p *WorkflowPriority) *Configuration {
+		c := LoadDefaultConfiguration()
+		c.Spec.WorkflowSpec = &WorkflowSpec{Priority: p}
+		return c
+	}
+
+	require.NoError(t, conf(nil).validateWorkflowSpec())
+	require.NoError(t, conf(&WorkflowPriority{}).validateWorkflowSpec())
+	require.Equal(t, []string{"critical", "high", "normal", "low", "background"}, PriorityLevels)
+	for _, level := range PriorityLevels {
+		require.NoError(t, conf(&WorkflowPriority{
+			Default:    &PriorityValues{PriorityLevel: new(level)},
+			Workflows:  []NamedPriorityValues{{Name: new("a"), PriorityLevel: new(level)}},
+			Activities: []NamedPriorityValues{{Name: new("a"), PriorityLevel: new(level)}},
+		}).validateWorkflowSpec(), level)
+	}
+	require.NoError(t, conf(&WorkflowPriority{
+		Default:    &PriorityValues{PriorityLevel: new(PriorityLevelLow), FairnessWeight: new(uint32(MaxFairnessWeight))},
+		Workflows:  []NamedPriorityValues{{Name: new("a"), PriorityLevel: new(PriorityLevelCritical)}, {Name: new("b"), FairnessWeight: new(uint32(1))}},
+		Activities: []NamedPriorityValues{{Name: new("a")}},
+	}).validateWorkflowSpec(), "the same name may appear in workflows and activities")
+
+	err := conf(&WorkflowPriority{Default: &PriorityValues{PriorityLevel: new("urgent")}}).validateWorkflowSpec()
+	require.ErrorContains(t, err, `invalid priorityLevel "urgent" in workflow priority default: must be one of critical, high, normal, low, background`)
+
+	err = conf(&WorkflowPriority{Workflows: []NamedPriorityValues{{Name: new("a"), PriorityLevel: new("Critical")}}}).validateWorkflowSpec()
+	require.ErrorContains(t, err, `invalid priorityLevel "Critical" in workflow priority workflows entry "a"`)
+
+	err = conf(&WorkflowPriority{Default: &PriorityValues{FairnessWeight: new(uint32(0))}}).validateWorkflowSpec()
+	require.ErrorContains(t, err, "invalid fairnessWeight 0 in workflow priority default: must be between 1 and 1000")
+
+	err = conf(&WorkflowPriority{Activities: []NamedPriorityValues{{Name: new("a"), FairnessWeight: new(uint32(1001))}}}).validateWorkflowSpec()
+	require.ErrorContains(t, err, `invalid fairnessWeight 1001 in workflow priority activities entry "a"`)
+
+	for _, w := range []uint32{1, 2, 500, 1000} {
+		require.NoError(t, conf(&WorkflowPriority{Default: &PriorityValues{FairnessWeight: new(w)}}).validateWorkflowSpec(), w)
+	}
+	for _, w := range []uint32{0, 1001, 100000} {
+		require.ErrorContains(t, conf(&WorkflowPriority{Default: &PriorityValues{FairnessWeight: new(w)}}).validateWorkflowSpec(), "invalid fairnessWeight", w)
+	}
+
+	err = conf(&WorkflowPriority{Activities: []NamedPriorityValues{{Name: new("a")}, {Name: new("a")}}}).validateWorkflowSpec()
+	require.ErrorContains(t, err, `duplicate name "a" in workflow priority activities`)
+
+	err = conf(&WorkflowPriority{Workflows: []NamedPriorityValues{{Name: new("a")}, {Name: new("a"), FairnessWeight: new(uint32(2))}}}).validateWorkflowSpec()
+	require.ErrorContains(t, err, `duplicate name "a" in workflow priority workflows`)
+
+	err = conf(&WorkflowPriority{Workflows: []NamedPriorityValues{{PriorityLevel: new(PriorityLevelHigh)}}}).validateWorkflowSpec()
+	require.ErrorContains(t, err, "workflow priority workflows entry requires a name")
+
+	err = conf(&WorkflowPriority{Activities: []NamedPriorityValues{{Name: new("")}}}).validateWorkflowSpec()
+	require.ErrorContains(t, err, "workflow priority activities entry requires a name")
+}
+
+func TestLoadStandaloneConfigurationPriority(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`apiVersion: dapr.io/v1alpha1
+kind: Configuration
+metadata:
+  name: priority
+spec:
+  workflow:
+    priority:
+      default:
+        priorityLevel: high
+      workflows:
+        - name: PaymentTransfer
+          priorityLevel: critical
+      activities:
+        - name: SendReceipt
+          fairnessWeight: 3
+`), 0o600))
+	c, err := LoadStandaloneConfiguration(path)
+	require.NoError(t, err)
+	level, weight := c.Spec.WorkflowSpec.ActivityPriority("PaymentTransfer", "SendReceipt")
+	require.Equal(t, PriorityLevelCritical, level)
+	require.InDelta(t, 3, weight, 1e-6)
+	level, weight = c.Spec.WorkflowSpec.ActivityPriority("Other", "Other")
+	require.Equal(t, PriorityLevelHigh, level)
+	require.Zero(t, weight)
+
+	require.NoError(t, os.WriteFile(path, []byte(`apiVersion: dapr.io/v1alpha1
+kind: Configuration
+metadata:
+  name: priority
+spec:
+  workflow:
+    priority:
+      activities:
+        - name: SendReceipt
+          fairnessWeight: 0
+`), 0o600))
+	_, err = LoadStandaloneConfiguration(path)
+	require.ErrorContains(t, err, "invalid fairnessWeight 0")
+}
